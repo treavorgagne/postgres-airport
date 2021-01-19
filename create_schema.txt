@@ -1,0 +1,324 @@
+-- create_schema.txt
+-- CSC 370 - Summer 2020 - Assignment 6
+-- Student Name: Treavor Gagne
+-- V-Number: V00890643
+-- B. Bird - 06/28/2020
+
+
+drop table if exists reservations;
+drop table if exists passengers;
+drop table if exists flights;
+drop table if exists airports;
+drop table if exists aircrafts;
+
+drop function if exists add_passenger_for_reservation_trigger();
+drop function if exists reservation_full_trigger();
+drop function if exists passenger_id_taken_trigger();
+drop function if exists airline_consistency_trigger();
+drop function if exists aircraft_downtime_trigger();
+drop function if exists flight_trigger();
+drop function if exists flight_delete_trigger();
+drop function if exists seating_capacity_trigger();
+drop function if exists aircraft_ownership_trigger();
+
+create table airports (
+	airport_code varchar(3) 
+		primary key
+		check(airport_code similar to '[A-Z]{3}'),
+	airport_name varchar(255) 
+		not null
+		check(char_length(airport_name) > 0),
+	country_name varchar(255) 
+		not null
+		check(char_length(country_name) > 0),
+	international BOOLEAN 
+		not null
+);
+
+create table aircrafts (
+	aircraft_id varchar(64)
+		primary key
+		check(char_length(aircraft_id) > 0),
+	airline_name varchar(255) 
+		not null
+		check(char_length(airline_name) > 0),
+	aircraft_model varchar(255) 
+		not null
+		check(char_length(aircraft_model) > 0),
+	capacity integer
+		not null
+		check(capacity >= 0)
+);
+
+create table flights(
+	flight_id integer primary key,
+	flight_airline varchar(255)
+		not null
+		check(char_length(flight_airline) > 0),
+	departure_airport_code varchar(3)
+		not null
+		check(departure_airport_code similar to '[A-Z]{3}'),
+arrival_airport_code varchar(3)
+	not null
+	check(arrival_airport_code similar to '[A-Z]{3}'),
+	departure_time timestamp
+		not null,
+	arrival_time timestamp
+		not null,
+	aircraft_id varchar(64)
+		not null
+		check(char_length(aircraft_id) > 0),
+	check( arrival_time <> departure_time and departure_time < arrival_time),
+	check(departure_airport_code <> arrival_airport_code),
+	foreign key(departure_airport_code) references airports(airport_code)
+		on delete restrict
+		on update cascade
+		deferrable,
+	foreign key(arrival_airport_code) references airports(airport_code)
+		on delete restrict
+		on update cascade
+		deferrable,
+	foreign key(aircraft_id) references aircrafts(aircraft_id)
+		on delete restrict
+		on update cascade
+		deferrable
+);
+
+create table passengers(
+	passenger_id integer primary key,
+	passenger_name varchar(1000)
+		not null
+		check(char_length(passenger_name) <= 1000 and char_length(passenger_name) > 0)
+);
+
+create table reservations(
+	flight_id integer
+		NOT NULL,
+	passenger_id integer
+		NOT NULL,
+	passenger_name varchar(1000)
+		not null
+		check(char_length(passenger_name) <= 1000 and char_length(passenger_name) > 0),
+	primary key(flight_id, passenger_id),
+	foreign key(flight_id) references flights(flight_id)
+		on delete restrict
+		on update cascade
+		deferrable,
+	foreign key(passenger_id) references passengers(passenger_id)
+		on delete restrict
+		on update cascade
+		deferrable
+);
+
+create function add_passenger_for_reservation_trigger()
+returns trigger as 
+$BODY$
+begin
+if (select count(*) from passengers where passenger_id = new.passenger_id) < 1
+then
+	insert into passengers values(new.passenger_id, new.passenger_name);
+end if;
+return new;
+end
+$BODY$
+language plpgsql;
+
+create trigger add_passenger_for_reservation
+	before insert on reservations
+	for each row
+	execute procedure add_passenger_for_reservation_trigger();
+
+create function reservation_full_trigger()
+returns trigger as 
+$BODY$
+begin
+if (select count(*) from reservations where flight_id = new.flight_id) > (select capacity from flights natural join aircrafts where flight_id = new.flight_id)
+then 
+	raise exception 'Error: Seat Capacity of flight is already full.';
+end if;
+return new;
+end
+$BODY$
+language plpgsql;
+
+create constraint trigger reservation_full
+	after insert on reservations
+	deferrable
+	for each row
+	execute procedure reservation_full_trigger();
+
+create function passenger_id_taken_trigger()
+returns trigger as 
+$BODY$
+begin
+if (select count(*) from reservations 
+		where passenger_id = new.passenger_id and 
+			passenger_name not in (select passenger_name from passengers where passenger_id = new.passenger_id)) > 0
+then
+	raise exception 'Error: Cannot create reservation for this passenger';
+end if;
+return new;
+end
+$BODY$
+language plpgsql;
+
+create trigger passenger_id_taken
+	after insert on reservations
+	for each row
+	execute procedure passenger_id_taken_trigger();
+
+create function airline_consistency_trigger()
+returns trigger as 
+$BODY$
+begin
+if 	(select country_name from flights left outer join airports on new.departure_airport_code = airports.airport_code where flight_id = new.flight_id) 
+	<> (select country_name from flights left outer join airports on new.arrival_airport_code = airports.airport_code where flight_id = new.flight_id)
+	and (select international from flights left outer join airports on new.departure_airport_code = airports.airport_code where flight_id = new.flight_id) = false
+    and (select international from flights left outer join airports on new.arrival_airport_code = airports.airport_code where flight_id = new.flight_id) = false
+		then raise exception 'Error: Cannot make international flights from domestic airports in different countries';
+elseif (select country_name from flights left outer join airports on new.departure_airport_code = airports.airport_code where flight_id = new.flight_id) 
+		<> (select country_name from flights left outer join airports on new.arrival_airport_code = airports.airport_code where flight_id = new.flight_id)
+		and (select international from flights left outer join airports on new.departure_airport_code = airports.airport_code where flight_id = new.flight_id) = true
+	    and (select international from flights left outer join airports on new.arrival_airport_code = airports.airport_code where flight_id = new.flight_id) = false
+			then raise exception 'Error: Cannot make flights from one international country airport to a domestic airport in another country.';
+elseif (select country_name from flights left outer join airports on new.departure_airport_code = airports.airport_code where flight_id = new.flight_id) 
+		<> (select country_name from flights left outer join airports on new.arrival_airport_code = airports.airport_code where flight_id = new.flight_id)
+		and (select international from flights left outer join airports on new.departure_airport_code = airports.airport_code where flight_id = new.flight_id) = false
+	    and (select international from flights left outer join airports on new.arrival_airport_code = airports.airport_code where flight_id = new.flight_id) = true
+			then raise exception 'Error: Cannot make flights from one domestic country airport to a international airport in another country.';
+end if;
+return new;
+end
+$BODY$
+language plpgsql;
+
+create constraint trigger airline_consistency
+	after insert or update on flights
+	deferrable
+	for each row
+	execute procedure airline_consistency_trigger();
+
+create function aircraft_downtime_trigger()
+returns trigger as 
+$BODY$
+begin
+if 	(select count(*) from (select *, (extract(epoch from (departure_time - new.arrival_time)) / 60) as downtime from flights) as T1 
+		where downtime < 60 and downtime >= 0 and aircraft_id = new.aircraft_id and departure_airport_code = new.arrival_airport_code) > 0
+	then raise exception 'Error: Arriving aircraft need 60 minutes of downtime before next flight for maintenance and refueling';
+elseif (select count(*) from (select *, (extract(epoch from (new.departure_time - arrival_time)) / 60) as downtime from flights) as T1 
+		where downtime < 60 and downtime >= 0 and aircraft_id = new.aircraft_id and arrival_airport_code = new.departure_airport_code) > 0
+	then raise exception 'Error: Departing aircraft need 60 minutes of downtime from previous flight for maintenance and refueling';
+end if;
+return new;
+end
+$BODY$
+language plpgsql;
+
+create constraint trigger aircraft_downtime
+	after insert or update on flights
+	deferrable
+	for each row
+	execute procedure aircraft_downtime_trigger();
+
+
+create function flight_trigger()
+returns trigger as 
+$BODY$
+begin
+if (select count(*) from (select *, lead(departure_airport_code, 1) over() as dest 
+		from (select *  from flights where aircraft_id = new.aircraft_id order by departure_time) as t1) as t2 where dest = arrival_airport_code) 
+	<> (select count(*)-1 from flights where aircraft_id = new.aircraft_id)
+	or
+	(select count(*) from (select *, extract(epoch from ((lead(departure_time, 1) over()) - arrival_time)) / 60 as time 
+		from (select *  from flights where aircraft_id = new.aircraft_id order by departure_time) as t1) as t2 where time > 60) 
+	<> (select count(*)-1 from flights where aircraft_id = new.aircraft_id)
+then raise exception 'Error: Update or insert flight breaks aircraft flight consistency';
+elseif (select count(*) from (select *, lag(arrival_airport_code, 1) over() as src 
+		from (select *  from flights where aircraft_id = new.aircraft_id order by departure_time) as t1) as t2 where src = departure_airport_code) 
+	<> (select count(*)-1 from flights where aircraft_id = new.aircraft_id)
+	or
+	(select count(*) from (select *, extract(epoch from (departure_time - (lag(arrival_time, 1) over()))) / 60 as time 
+		from (select *  from flights where aircraft_id = new.aircraft_id order by departure_time) as t1) as t2 where time > 60) 
+	<> (select count(*)-1 from flights where aircraft_id = new.aircraft_id)
+then raise exception 'Error: Update or insert flight breaks aircraft flight consistency';
+end if;
+return new;
+end
+$BODY$
+language plpgsql;
+	
+create constraint trigger flight_trigger
+	after update or insert on flights
+	deferrable
+	for each row
+	execute procedure flight_trigger();
+
+create function flight_delete_trigger()
+returns trigger as 
+$BODY$
+begin
+if (select count(*) from (select *, lead(departure_airport_code, 1) over() as dest 
+		from (select *  from flights where aircraft_id = old.aircraft_id order by departure_time) as t1) as t2 where dest = arrival_airport_code) 
+	<> (select count(*)-1 from flights where aircraft_id = old.aircraft_id)
+	or
+	(select count(*) from (select *, extract(epoch from ((lead(departure_time, 1) over()) - arrival_time)) / 60 as time 
+		from (select *  from flights where aircraft_id = old.aircraft_id order by departure_time) as t1) as t2 where time > 60) 
+	<> (select count(*)-1 from flights where aircraft_id = old.aircraft_id)
+then raise exception 'Error: Delete flight breaks aircraft flight consistency';
+elseif (select count(*) from (select *, lag(arrival_airport_code, 1) over() as src 
+		from (select *  from flights where aircraft_id = old.aircraft_id order by departure_time) as t1) as t2 where src = departure_airport_code) 
+	<> (select count(*)-1 from flights where aircraft_id = old.aircraft_id)
+	or
+	(select count(*) from (select *, extract(epoch from (departure_time - (lag(arrival_time, 1) over()))) / 60 as time 
+		from (select *  from flights where aircraft_id = old.aircraft_id order by departure_time) as t1) as t2 where time > 60) 
+	<> (select count(*)-1 from flights where aircraft_id = old.aircraft_id)
+then raise exception 'Error: Delete flight breaks aircraft flight consistency';
+end if;
+return new;
+end
+$BODY$
+language plpgsql;
+
+create constraint trigger flight_delete_trigger
+	after delete on flights
+	deferrable
+	for each row
+	execute procedure flight_delete_trigger();
+
+create function seating_capacity_trigger()
+returns trigger as 
+$BODY$
+begin
+if (select count(*) 
+	from (select * from (select flight_id, aircraft_id, capacity from flights natural join aircrafts where flight_id = new.flight_id) as t1 
+						natural join (select flight_id, count(*) as total_reservations from reservations group by flight_id) as t2) as t3
+			where capacity < total_reservations) > 0
+then raise exception 'Error: Aircraft must have enough seats to accommadate passenger reservations';
+end if;
+return new;
+end
+$BODY$
+language plpgsql;
+	
+create constraint trigger seating_capacity_trigger
+	after update on flights
+	deferrable
+	for each row
+	execute procedure seating_capacity_trigger();
+
+create function aircraft_ownership_trigger()
+returns trigger as 
+$BODY$
+begin
+if (select count(*) from (select * from flights natural join aircrafts where flight_id = new.flight_id) as t1 where airline_name = new.flight_airline) = 0
+then raise exception 'Error: Flight airline must match the aircrafts airline';
+end if;
+return new;
+end
+$BODY$
+language plpgsql;
+	
+create  trigger aircraft_ownership
+	after update or insert on flights
+	for each row
+	execute procedure aircraft_ownership_trigger();
